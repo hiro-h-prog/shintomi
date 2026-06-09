@@ -1,3 +1,2 @@
-playwright==1.49.0
-gspread==6.1.4
-google-auth==2.37.0
+curl_cffi==0.7.4     ← 追加
+beautifulsoup4==4.12.3 ← 追加（HTML解析用）
