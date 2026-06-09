@@ -1,14 +1,16 @@
+# -*- coding: utf-8 -*-
 """
 防衛関連サイト スクレイピング → Google Sheets 書き込み
-GitHub Actions から実行する
+GitHub Actions セルフホストランナー（Windows）から実行する
 
-mod.go.jp … Cloudflare対策のため curl_cffi でHTTPリクエスト
+mod.go.jp … curl_cffi で Cloudflare を回避
 新富町    … Playwright でJS描画ページを取得
 """
 
 import asyncio
 import os
 import re
+import sys
 import json
 from datetime import datetime
 from playwright.async_api import async_playwright, Page
@@ -16,6 +18,13 @@ from curl_cffi.requests import AsyncSession
 from bs4 import BeautifulSoup
 from google.oauth2.service_account import Credentials
 import gspread
+
+# Windows での文字化け対策
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+    # curl_cffi の Proactor ループ警告を回避
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
 
@@ -42,7 +51,6 @@ def get_sheet_client():
 # ──────────────────────────────────────────────
 
 async def fetch_html(session: AsyncSession, url: str) -> BeautifulSoup | None:
-    """curl_cffi でHTMLを取得してBeautifulSoupで返す"""
     try:
         r = await session.get(url, headers=CF_HEADERS, timeout=30, impersonate="chrome124")
         r.raise_for_status()
@@ -82,7 +90,6 @@ async def scrape_js_topics(session: AsyncSession) -> list[dict]:
     if not soup:
         return []
     result = []
-    # リスト・段落を幅広く拾う
     for tag in soup.select("li, p, dt, dd"):
         text = tag.get_text(" ", strip=True)
         if len(text) < 15 or len(text) > 300:
@@ -113,21 +120,35 @@ async def scrape_asdf_news(session: AsyncSession) -> list[dict]:
     return result[:50]
 
 async def scrape_kyushu_rdb(session: AsyncSession) -> list[dict]:
-    """九州防衛局 新着情報"""
+    """九州防衛局 新着情報 — フォールバック付き"""
     soup = await fetch_html(session, "https://www.mod.go.jp/rdb/kyushu/index.html")
     if not soup:
         return []
     result = []
-    for a in soup.select("a[href]")[:100]:
+    for a in soup.select("a[href]")[:150]:
         href = a.get("href", "")
-        if "/rdb/kyushu" not in href:
+        # /rdb/kyushu 配下 OR 九州防衛局ドメイン配下を広めに拾う
+        if "/rdb/kyushu" not in href and "/rdb/" not in href:
             continue
         text = a.get_text(" ", strip=True)
-        if len(text) < 6:
+        if len(text) < 6 or text in ("トップ", "ホーム", "サイトマップ", "English"):
             continue
         url = href if href.startswith("http") else "https://www.mod.go.jp" + href
         clean = re.sub(r'^\d{4}[年.]\d{1,2}[月.]\d{1,2}日?\s*', '', text).strip()
         result.append({"date": extract_date(text), "title": clean[:150], "url": url})
+    # 0件のときは全リンクを対象にして再試行
+    if not result:
+        for a in soup.select("a[href]")[:200]:
+            href = a.get("href", "")
+            if not href or href.startswith("#") or href.startswith("mailto"):
+                continue
+            text = a.get_text(" ", strip=True)
+            if len(text) < 10:
+                continue
+            url = href if href.startswith("http") else "https://www.mod.go.jp" + href
+            result.append({"date": extract_date(text), "title": text[:150], "url": url})
+            if len(result) >= 30:
+                break
     return result[:50]
 
 
@@ -195,7 +216,7 @@ async def main():
     spreadsheet = client.open_by_key(SPREADSHEET_ID)
     log_rows = []
 
-    # ── curl_cffi で mod.go.jp 4サイト ──
+    # curl_cffi で mod.go.jp 4サイト
     async with AsyncSession() as session:
         mod_scrapers = [
             ("統合幕僚監部_報道発表",   scrape_js_press),
@@ -211,14 +232,14 @@ async def main():
                     write_to_sheet(spreadsheet, sheet_name, items, fetched_at)
                     log_rows.append([fetched_at, sheet_name, len(items), "success", ""])
                 else:
-                    print("  [WARN] 0件（ブロックまたは構造変更の可能性）")
+                    print("  [WARN] 0件（ページ構造を確認してください）")
                     log_rows.append([fetched_at, sheet_name, 0, "warn", "0件"])
             except Exception as e:
                 print(f"  [ERROR] {e}")
                 log_rows.append([fetched_at, sheet_name, 0, "error", str(e)])
             await asyncio.sleep(2)
 
-    # ── Playwright で新富町 ──
+    # Playwright で新富町
     print(f"\n[TARGET] 新富町_新着")
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
