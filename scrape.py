@@ -119,39 +119,62 @@ async def scrape_asdf_news(session: AsyncSession) -> list[dict]:
     return result[:50]
 
 async def scrape_kyushu_rdb(session: AsyncSession) -> list[dict]:
-    """九州防衛局 新着情報"""
+    """九州防衛局 新着情報
+    トップページの新着セクションをテキストパースで取得する。
+    JSレンダリングなしで日付+タイトルのパターンを抽出。
+    """
     base = "https://www.mod.go.jp/rdb/kyushu"
     soup = await fetch_html(session, base + "/index.html")
     if not soup:
         return []
 
-    SKIP_TEXTS = {"トップ", "ホーム", "サイトマップ", "English", "文字サイズ", "お問い合わせ"}
     result = []
 
-    for a in soup.select("a[href]")[:200]:
-        href = a.get("href", "").strip()
-        if not href or href.startswith("#") or href.startswith("mailto"):
+    # 方法①: 新着セクション内の <li> や <dd> から日付＋リンクを抽出
+    # 九州防衛局のトップは「新着情報」セクションに日付テキスト＋aタグが並ぶ構造
+    DATE_PATTERN = re.compile(r'(\d{4}年\d{1,2}月\d{1,2}日)')
+
+    # 日付テキストを含む親要素を探す
+    for elem in soup.find_all(["li", "dd", "p", "div", "tr"])[:300]:
+        text = elem.get_text(" ", strip=True)
+        if not DATE_PATTERN.search(text):
+            continue
+        if len(text) < 10 or len(text) > 400:
             continue
 
-        # 絶対URLに正規化
+        a = elem.find("a", href=True)
+        href = a["href"].strip() if a else ""
         if href.startswith("http"):
             url = href
         elif href.startswith("/"):
             url = "https://www.mod.go.jp" + href
-        else:
-            # 相対URL（例: "topics/xxx.html"）→ baseから結合
+        elif href:
             url = base + "/" + href
+        else:
+            url = ""
 
-        # 九州防衛局ドメイン配下のみ対象
-        if "mod.go.jp/rdb/kyushu" not in url and "kyushu.rdb.mod.go.jp" not in url:
+        date = extract_date(text)
+        title = re.sub(r'^\d{4}年\d{1,2}月\d{1,2}日\s*[『「]?', '', text).strip()
+        title = re.sub(r'[』」].*$', '', title).strip()
+        if not title:
             continue
 
-        text = a.get_text(" ", strip=True)
-        if len(text) < 6 or text in SKIP_TEXTS:
-            continue
+        result.append({"date": date, "title": title[:150], "url": url})
+        if len(result) >= 50:
+            break
 
-        clean = re.sub(r'^\d{4}[年.]\d{1,2}[月.]\d{1,2}日?\s*', '', text).strip()
-        result.append({"date": extract_date(text), "title": clean[:150], "url": url})
+    # 方法②: 上記で取れなかった場合、全文から日付行を抽出
+    if not result:
+        body_text = soup.get_text("\n")
+        for line in body_text.split("\n"):
+            line = line.strip()
+            if not DATE_PATTERN.search(line) or len(line) < 15:
+                continue
+            date = extract_date(line)
+            title = re.sub(r'^\d{4}年\d{1,2}月\d{1,2}日\s*', '', line).strip()[:150]
+            result.append({"date": date, "title": title, "url": ""})
+            if len(result) >= 30:
+                break
 
     return result[:50]
 
