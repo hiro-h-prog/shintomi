@@ -3,8 +3,8 @@
 防衛関連サイト スクレイピング → Google Sheets 書き込み
 GitHub Actions セルフホストランナー（Windows）から実行する
 
-mod.go.jp … curl_cffi で Cloudflare を回避
-新富町    … Playwright でJS描画ページを取得
+mod.go.jp … curl_cffi で Cloudflare を回避（SelectorEventLoop必須）
+新富町    … scrape_shintomi.py を別プロセスで呼び出し（PlaywrightはProactorEventLoop必須）
 """
 
 import asyncio
@@ -12,18 +12,17 @@ import os
 import re
 import sys
 import json
+import subprocess
 from datetime import datetime
-from playwright.async_api import async_playwright, Page
 from curl_cffi.requests import AsyncSession
 from bs4 import BeautifulSoup
 from google.oauth2.service_account import Credentials
 import gspread
 
-# Windows での文字化け対策
+# Windows: 文字化け対策 + curl_cffi 用に SelectorEventLoop を設定
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
-    # curl_cffi の Proactor ループ警告を回避
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
@@ -120,14 +119,13 @@ async def scrape_asdf_news(session: AsyncSession) -> list[dict]:
     return result[:50]
 
 async def scrape_kyushu_rdb(session: AsyncSession) -> list[dict]:
-    """九州防衛局 新着情報 — フォールバック付き"""
+    """九州防衛局 新着情報"""
     soup = await fetch_html(session, "https://www.mod.go.jp/rdb/kyushu/index.html")
     if not soup:
         return []
     result = []
     for a in soup.select("a[href]")[:150]:
         href = a.get("href", "")
-        # /rdb/kyushu 配下 OR 九州防衛局ドメイン配下を広めに拾う
         if "/rdb/kyushu" not in href and "/rdb/" not in href:
             continue
         text = a.get_text(" ", strip=True)
@@ -136,7 +134,6 @@ async def scrape_kyushu_rdb(session: AsyncSession) -> list[dict]:
         url = href if href.startswith("http") else "https://www.mod.go.jp" + href
         clean = re.sub(r'^\d{4}[年.]\d{1,2}[月.]\d{1,2}日?\s*', '', text).strip()
         result.append({"date": extract_date(text), "title": clean[:150], "url": url})
-    # 0件のときは全リンクを対象にして再試行
     if not result:
         for a in soup.select("a[href]")[:200]:
             href = a.get("href", "")
@@ -153,29 +150,23 @@ async def scrape_kyushu_rdb(session: AsyncSession) -> list[dict]:
 
 
 # ──────────────────────────────────────────────
-# 新富町: Playwright（JSレンダリングが必要）
+# 新富町: 別プロセス（scrape_shintomi.py）で実行
+# PlaywrightはProactorEventLoopが必要なため分離
 # ──────────────────────────────────────────────
 
-async def scrape_shintomi(page: Page) -> list[dict]:
-    """新富町 新着情報"""
-    await page.goto("https://www.town.shintomi.lg.jp/news_list.html",
-                    wait_until="networkidle", timeout=30000)
-    items = await page.eval_on_selector_all(
-        "a.newPageLink",
-        """els => els.map(a => ({
-            title: a.innerText.trim().replace(/\\s+/g,' '),
-            url: a.href
-        })).filter(x => x.title.length > 5)"""
+def scrape_shintomi_subprocess() -> list[dict]:
+    """scrape_shintomi.py を別プロセスで実行してJSONを受け取る"""
+    script = os.path.join(os.path.dirname(__file__), "scrape_shintomi.py")
+    proc = subprocess.run(
+        [sys.executable, script],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=60,
     )
-    result = []
-    for item in items[:50]:
-        m = re.search(r'(\d{4}年\d{1,2}月\d{1,2}日|\d{4}[-/]\d{1,2}[-/]\d{1,2})', item["title"])
-        result.append({
-            "date":  m.group(1) if m else "",
-            "title": item["title"][:150],
-            "url":   item["url"],
-        })
-    return result
+    if proc.returncode != 0:
+        raise RuntimeError(f"scrape_shintomi.py failed:\n{proc.stderr}")
+    return json.loads(proc.stdout.strip())
 
 
 # ──────────────────────────────────────────────
@@ -232,31 +223,22 @@ async def main():
                     write_to_sheet(spreadsheet, sheet_name, items, fetched_at)
                     log_rows.append([fetched_at, sheet_name, len(items), "success", ""])
                 else:
-                    print("  [WARN] 0件（ページ構造を確認してください）")
+                    print("  [WARN] 0件")
                     log_rows.append([fetched_at, sheet_name, 0, "warn", "0件"])
             except Exception as e:
                 print(f"  [ERROR] {e}")
                 log_rows.append([fetched_at, sheet_name, 0, "error", str(e)])
             await asyncio.sleep(2)
 
-    # Playwright で新富町
+    # 新富町: 別プロセスで実行
     print(f"\n[TARGET] 新富町_新着")
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        ctx = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
-            locale="ja-JP",
-        )
-        page = await ctx.new_page()
-        try:
-            items = await scrape_shintomi(page)
-            write_to_sheet(spreadsheet, "新富町_新着", items, fetched_at)
-            log_rows.append([fetched_at, "新富町_新着", len(items), "success", ""])
-        except Exception as e:
-            print(f"  [ERROR] {e}")
-            log_rows.append([fetched_at, "新富町_新着", 0, "error", str(e)])
-        finally:
-            await browser.close()
+    try:
+        items = scrape_shintomi_subprocess()
+        write_to_sheet(spreadsheet, "新富町_新着", items, fetched_at)
+        log_rows.append([fetched_at, "新富町_新着", len(items), "success", ""])
+    except Exception as e:
+        print(f"  [ERROR] {e}")
+        log_rows.append([fetched_at, "新富町_新着", 0, "error", str(e)])
 
     write_log(spreadsheet, log_rows)
     print(f"\n=== スクレイピング完了: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n")
