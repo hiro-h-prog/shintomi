@@ -120,32 +120,39 @@ async def scrape_asdf_news(session: AsyncSession) -> list[dict]:
 
 async def scrape_kyushu_rdb(session: AsyncSession) -> list[dict]:
     """九州防衛局 新着情報"""
-    soup = await fetch_html(session, "https://www.mod.go.jp/rdb/kyushu/index.html")
+    base = "https://www.mod.go.jp/rdb/kyushu"
+    soup = await fetch_html(session, base + "/index.html")
     if not soup:
         return []
+
+    SKIP_TEXTS = {"トップ", "ホーム", "サイトマップ", "English", "文字サイズ", "お問い合わせ"}
     result = []
-    for a in soup.select("a[href]")[:150]:
-        href = a.get("href", "")
-        if "/rdb/kyushu" not in href and "/rdb/" not in href:
+
+    for a in soup.select("a[href]")[:200]:
+        href = a.get("href", "").strip()
+        if not href or href.startswith("#") or href.startswith("mailto"):
             continue
+
+        # 絶対URLに正規化
+        if href.startswith("http"):
+            url = href
+        elif href.startswith("/"):
+            url = "https://www.mod.go.jp" + href
+        else:
+            # 相対URL（例: "topics/xxx.html"）→ baseから結合
+            url = base + "/" + href
+
+        # 九州防衛局ドメイン配下のみ対象
+        if "mod.go.jp/rdb/kyushu" not in url and "kyushu.rdb.mod.go.jp" not in url:
+            continue
+
         text = a.get_text(" ", strip=True)
-        if len(text) < 6 or text in ("トップ", "ホーム", "サイトマップ", "English"):
+        if len(text) < 6 or text in SKIP_TEXTS:
             continue
-        url = href if href.startswith("http") else "https://www.mod.go.jp" + href
+
         clean = re.sub(r'^\d{4}[年.]\d{1,2}[月.]\d{1,2}日?\s*', '', text).strip()
         result.append({"date": extract_date(text), "title": clean[:150], "url": url})
-    if not result:
-        for a in soup.select("a[href]")[:200]:
-            href = a.get("href", "")
-            if not href or href.startswith("#") or href.startswith("mailto"):
-                continue
-            text = a.get_text(" ", strip=True)
-            if len(text) < 10:
-                continue
-            url = href if href.startswith("http") else "https://www.mod.go.jp" + href
-            result.append({"date": extract_date(text), "title": text[:150], "url": url})
-            if len(result) >= 30:
-                break
+
     return result[:50]
 
 
