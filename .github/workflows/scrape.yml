@@ -1,0 +1,36 @@
+name: 防衛関連サイト スクレイピング
+
+on:
+  schedule:
+    # 毎日 8:00, 12:00, 18:00 JST (UTC -9h) に実行
+    - cron: "0 23 * * *"   # 08:00 JST
+    - cron: "0 3 * * *"    # 12:00 JST
+    - cron: "0 9 * * *"    # 18:00 JST
+  workflow_dispatch:       # 手動実行ボタンも有効化
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: リポジトリをチェックアウト
+        uses: actions/checkout@v4
+
+      - name: Python セットアップ
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: 依存パッケージをインストール
+        run: pip install -r requirements.txt
+
+      - name: Playwright Chromium をインストール
+        run: playwright install chromium --with-deps
+
+      - name: スクレイピング実行
+        env:
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: python scrape.py
