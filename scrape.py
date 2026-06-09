@@ -170,7 +170,7 @@ def write_to_sheet(spreadsheet, sheet_name: str, items: list[dict], fetched_at: 
     rows = [["取得日時", "日付", "タイトル", "URL"]]
     for item in items:
         rows.append([fetched_at, item.get("date",""), item.get("title",""), item.get("url","")])
-    ws.update("A1", rows)
+    ws.update(rows, "A1")
     print(f"  [WRITE] {sheet_name}: {len(items)}件")
 
 def write_log(spreadsheet, log_rows: list):
