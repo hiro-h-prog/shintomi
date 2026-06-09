@@ -1,382 +1,244 @@
+"""
+防衛関連サイト スクレイピング → Google Sheets 書き込み
+GitHub Actions から実行する
+
+mod.go.jp … Cloudflare対策のため curl_cffi でHTTPリクエスト
+新富町    … Playwright でJS描画ページを取得
+"""
+
+import asyncio
 import os
-import json
 import re
-import time
-import traceback
-from datetime import datetime, timezone, timedelta
-
-import gspread
+import json
+from datetime import datetime
+from playwright.async_api import async_playwright, Page
+from curl_cffi.requests import AsyncSession
+from bs4 import BeautifulSoup
 from google.oauth2.service_account import Credentials
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
-
-# ─────────────────────────────────────────────
-# 定数
-# ─────────────────────────────────────────────
-JST = timezone(timedelta(hours=9))
-NOW_STR = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
+import gspread
 
 SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
-SERVICE_ACCOUNT_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
 
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
-]
+CF_HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ja,en-US;q=0.7,en;q=0.3",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+}
 
-TARGETS = [
-    {
-        "sheet": "統合幕僚監部_報道発表",
-        "url": "https://www.mod.go.jp/js/press/index.html",
-        "selector": "a",
-        "filter_href": "/js/press/",
-        "base_url": "https://www.mod.go.jp",
-        "date_selector": None,
-        "cloudflare": True,
-    },
-    {
-        "sheet": "統合幕僚監部_トピックス",
-        "url": "https://www.mod.go.jp/js/about/topics.html",
-        "selector": "a",
-        "filter_href": "/js/",
-        "base_url": "https://www.mod.go.jp",
-        "date_selector": None,
-        "cloudflare": True,
-    },
-    {
-        "sheet": "航空自衛隊_ニュース",
-        "url": "https://www.mod.go.jp/asdf/news/",
-        "selector": "a",
-        "filter_href": "/asdf/news/",
-        "base_url": "https://www.mod.go.jp",
-        "date_selector": None,
-        "cloudflare": True,
-    },
-    {
-        "sheet": "九州防衛局_新着",
-        "url": "https://www.mod.go.jp/rdb/kyushu/index.html",
-        "selector": "a",
-        "filter_href": "/rdb/kyushu/",
-        "base_url": "https://www.mod.go.jp",
-        "date_selector": None,
-        "cloudflare": True,
-    },
-    {
-        "sheet": "新富町_新着",
-        "url": "https://www.town.shintomi.lg.jp/news_list.html",
-        "selector": "a.newPageLink",
-        "filter_href": None,
-        "base_url": "https://www.town.shintomi.lg.jp",
-        "date_selector": "span.newPageDate",
-        "cloudflare": False,
-    },
-]
+def get_sheet_client():
+    creds_data = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = Credentials.from_service_account_info(creds_data, scopes=scopes)
+    return gspread.authorize(creds)
 
-# ─────────────────────────────────────────────
-# Google Sheets クライアント初期化
-# ─────────────────────────────────────────────
-def init_gspread():
-    service_account_info = json.loads(SERVICE_ACCOUNT_JSON)
-    creds = Credentials.from_service_account_info(service_account_info, scopes=SCOPES)
-    client = gspread.authorize(creds)
-    return client
 
-# ─────────────────────────────────────────────
-# シート操作ユーティリティ
-# ─────────────────────────────────────────────
-def get_or_create_sheet(spreadsheet, sheet_name: str):
+# ──────────────────────────────────────────────
+# mod.go.jp 系: curl_cffi で Cloudflare を回避
+# ──────────────────────────────────────────────
+
+async def fetch_html(session: AsyncSession, url: str) -> BeautifulSoup | None:
+    """curl_cffi でHTMLを取得してBeautifulSoupで返す"""
     try:
-        return spreadsheet.worksheet(sheet_name)
-    except gspread.WorksheetNotFound:
-        print(f"  [INFO] シート '{sheet_name}' が存在しないため新規作成します")
-        return spreadsheet.add_worksheet(title=sheet_name, rows=1000, cols=10)
+        r = await session.get(url, headers=CF_HEADERS, timeout=30, impersonate="chrome124")
+        r.raise_for_status()
+        return BeautifulSoup(r.text, "html.parser")
+    except Exception as e:
+        print(f"    [ERROR] {url}: {e}")
+        return None
 
-def ensure_header(sheet):
-    header = ["取得日時", "タイトル", "URL", "日付テキスト"]
-    existing = sheet.row_values(1)
-    if existing != header:
-        sheet.insert_row(header, index=1)
+def extract_date(text: str) -> str:
+    m = re.search(r'(\d{4}年\d{1,2}月\d{1,2}日|\d{4}\.\d{1,2}\.\d{1,2}|\d{4}[-/]\d{1,2}[-/]\d{1,2})', text)
+    return m.group(1) if m else ""
 
-def get_existing_urls(sheet) -> set:
-    try:
-        url_col = sheet.col_values(3)
-        return set(url_col[1:]) if len(url_col) > 1 else set()
-    except Exception:
-        return set()
+async def scrape_js_press(session: AsyncSession) -> list[dict]:
+    """統合幕僚監部 報道発表資料"""
+    soup = await fetch_html(session, "https://www.mod.go.jp/js/press/index.html")
+    if not soup:
+        return []
+    result = []
+    for a in soup.select("a[href]")[:80]:
+        href = a.get("href", "")
+        if "/js/pdf/" not in href and "/js/press/" not in href:
+            continue
+        text = a.get_text(" ", strip=True)
+        if len(text) < 6:
+            continue
+        url = href if href.startswith("http") else "https://www.mod.go.jp" + href
+        result.append({
+            "date":  extract_date(text),
+            "title": re.sub(r'^\d{4}年\d{1,2}月\d{1,2}日\s*(公表\s*)?', '', text).strip()[:150],
+            "url":   url,
+        })
+    return result[:50]
 
-def append_rows_to_sheet(sheet, rows: list):
-    if not rows:
-        return
-    sheet.append_rows(rows, value_input_option="USER_ENTERED")
+async def scrape_js_topics(session: AsyncSession) -> list[dict]:
+    """統合幕僚監部 出来事（トピックス）"""
+    soup = await fetch_html(session, "https://www.mod.go.jp/js/about/topics.html")
+    if not soup:
+        return []
+    result = []
+    # リスト・段落を幅広く拾う
+    for tag in soup.select("li, p, dt, dd"):
+        text = tag.get_text(" ", strip=True)
+        if len(text) < 15 or len(text) > 300:
+            continue
+        a = tag.find("a")
+        href = a["href"] if a and a.get("href") else ""
+        url = ("https://www.mod.go.jp" + href) if href and not href.startswith("http") else href
+        result.append({"date": extract_date(text), "title": text[:150], "url": url})
+        if len(result) >= 30:
+            break
+    return result
 
-# ─────────────────────────────────────────────
-# URL正規化
-# ─────────────────────────────────────────────
-def normalize_url(href: str, base_url: str) -> str:
-    if not href:
-        return ""
-    href = href.strip()
-    if href.startswith("http://") or href.startswith("https://"):
-        return href
-    if href.startswith("//"):
-        return "https:" + href
-    if href.startswith("/"):
-        match = re.match(r"(https?://[^/]+)", base_url)
-        domain = match.group(1) if match else base_url
-        return domain + href
-    return base_url.rstrip("/") + "/" + href.lstrip("./")
+async def scrape_asdf_news(session: AsyncSession) -> list[dict]:
+    """航空自衛隊 ニュース"""
+    soup = await fetch_html(session, "https://www.mod.go.jp/asdf/news/")
+    if not soup:
+        return []
+    result = []
+    for a in soup.select("a[href]")[:100]:
+        href = a.get("href", "")
+        if "/asdf/news" not in href and "/asdf/pdf" not in href:
+            continue
+        text = a.get_text(" ", strip=True)
+        if len(text) < 6:
+            continue
+        url = href if href.startswith("http") else "https://www.mod.go.jp" + href
+        result.append({"date": extract_date(text), "title": text[:150], "url": url})
+    return result[:50]
 
-# ─────────────────────────────────────────────
-# Cloudflare 回避用ブラウザコンテキスト生成
-# ─────────────────────────────────────────────
-def create_context(browser, cloudflare: bool):
-    """
-    cloudflare=True の場合は人間らしいヘッダーを付与したコンテキストを返す
-    """
-    common_args = dict(
-        locale="ja-JP",
-        timezone_id="Asia/Tokyo",
-        viewport={"width": 1280, "height": 800},
+async def scrape_kyushu_rdb(session: AsyncSession) -> list[dict]:
+    """九州防衛局 新着情報"""
+    soup = await fetch_html(session, "https://www.mod.go.jp/rdb/kyushu/index.html")
+    if not soup:
+        return []
+    result = []
+    for a in soup.select("a[href]")[:100]:
+        href = a.get("href", "")
+        if "/rdb/kyushu" not in href:
+            continue
+        text = a.get_text(" ", strip=True)
+        if len(text) < 6:
+            continue
+        url = href if href.startswith("http") else "https://www.mod.go.jp" + href
+        clean = re.sub(r'^\d{4}[年.]\d{1,2}[月.]\d{1,2}日?\s*', '', text).strip()
+        result.append({"date": extract_date(text), "title": clean[:150], "url": url})
+    return result[:50]
+
+
+# ──────────────────────────────────────────────
+# 新富町: Playwright（JSレンダリングが必要）
+# ──────────────────────────────────────────────
+
+async def scrape_shintomi(page: Page) -> list[dict]:
+    """新富町 新着情報"""
+    await page.goto("https://www.town.shintomi.lg.jp/news_list.html",
+                    wait_until="networkidle", timeout=30000)
+    items = await page.eval_on_selector_all(
+        "a.newPageLink",
+        """els => els.map(a => ({
+            title: a.innerText.trim().replace(/\\s+/g,' '),
+            url: a.href
+        })).filter(x => x.title.length > 5)"""
     )
-    if cloudflare:
-        return browser.new_context(
-            **common_args,
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            extra_http_headers={
-                "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
-                "Accept": (
-                    "text/html,application/xhtml+xml,"
-                    "application/xml;q=0.9,image/avif,"
-                    "image/webp,*/*;q=0.8"
-                ),
-                "Accept-Encoding": "gzip, deflate, br",
-                "Connection": "keep-alive",
-                "Upgrade-Insecure-Requests": "1",
-                "Sec-Fetch-Dest": "document",
-                "Sec-Fetch-Mode": "navigate",
-                "Sec-Fetch-Site": "none",
-                "Sec-Fetch-User": "?1",
-            },
-        )
-    else:
-        return browser.new_context(
-            **common_args,
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-        )
+    result = []
+    for item in items[:50]:
+        m = re.search(r'(\d{4}年\d{1,2}月\d{1,2}日|\d{4}[-/]\d{1,2}[-/]\d{1,2})', item["title"])
+        result.append({
+            "date":  m.group(1) if m else "",
+            "title": item["title"][:150],
+            "url":   item["url"],
+        })
+    return result
 
-# ─────────────────────────────────────────────
-# スクレイピング本体
-# ─────────────────────────────────────────────
-def scrape_site(browser, target: dict) -> list:
-    results = []
-    url = target["url"]
-    selector = target["selector"]
-    base_url = target["base_url"]
-    filter_href = target.get("filter_href")
-    date_selector = target.get("date_selector")
-    cloudflare = target.get("cloudflare", False)
 
-    print(f"  [SCRAPE] {url}")
+# ──────────────────────────────────────────────
+# Sheets 書き込み
+# ──────────────────────────────────────────────
 
-    context = create_context(browser, cloudflare)
-    page = context.new_page()
-
+def write_to_sheet(spreadsheet, sheet_name: str, items: list[dict], fetched_at: str):
     try:
-        page.goto(url, timeout=45000, wait_until="domcontentloaded")
+        ws = spreadsheet.worksheet(sheet_name)
+        ws.clear()
+    except gspread.WorksheetNotFound:
+        ws = spreadsheet.add_worksheet(sheet_name, rows=500, cols=4)
+    rows = [["取得日時", "日付", "タイトル", "URL"]]
+    for item in items:
+        rows.append([fetched_at, item.get("date",""), item.get("title",""), item.get("url","")])
+    ws.update("A1", rows)
+    print(f"  [WRITE] {sheet_name}: {len(items)}件")
 
-        if cloudflare:
-            # Cloudflare チャレンジの通過を待つ（最大15秒）
-            print(f"    [WAIT] Cloudflare チェック待機中...")
-            page.wait_for_timeout(5000)
-
-            # Cloudflare ブロック判定
-            content = page.content()
-            if "Cloudflare" in content and "セキュリティ" in content:
-                print(f"    [WARN] Cloudflare にブロックされました: {url}")
-                return []
-        else:
-            page.wait_for_timeout(2000)
-
-        # 要素取得
-        elements = page.query_selector_all(selector)
-        print(f"    [HIT] selector='{selector}' → {len(elements)}件")
-
-        seen_urls = set()
-        for el in elements:
-            try:
-                href = el.get_attribute("href") or ""
-                title = (el.inner_text() or "").strip()
-
-                # タイトルが短すぎるものを除外
-                if not title or len(title) < 4:
-                    continue
-
-                abs_url = normalize_url(href, base_url)
-                if not abs_url:
-                    continue
-
-                # filter_href が指定されている場合はパスでフィルタリング
-                if filter_href:
-                    if filter_href not in abs_url:
-                        continue
-                    # インデックスページ自体は除外
-                    if abs_url.rstrip("/") == url.rstrip("/"):
-                        continue
-
-                if abs_url in seen_urls:
-                    continue
-                seen_urls.add(abs_url)
-
-                # 日付テキストの取得
-                date_text = ""
-                if date_selector:
-                    # 親要素から date_selector で日付を探す
-                    try:
-                        parent = el.evaluate_handle(
-                            "el => el.closest('li') || el.parentElement"
-                        )
-                        date_el = parent.as_element().query_selector(date_selector) if parent.as_element() else None
-                        if date_el:
-                            date_text = (date_el.inner_text() or "").strip()
-                    except Exception:
-                        pass
-                else:
-                    # 親要素のテキストから日付パターンを抽出
-                    try:
-                        parent_text = el.evaluate(
-                            "el => el.parentElement ? el.parentElement.innerText : ''"
-                        )
-                        patterns = [
-                            r"\d{4}[.\-/]\d{1,2}[.\-/]\d{1,2}",
-                            r"令和\d+年\d+月\d+日",
-                            r"R\d+[.\-/]\d{1,2}[.\-/]\d{1,2}",
-                            r"\d{4}年\d{1,2}月\d{1,2}日",
-                        ]
-                        for pattern in patterns:
-                            match = re.search(pattern, parent_text)
-                            if match:
-                                date_text = match.group(0)
-                                break
-                    except Exception:
-                        pass
-
-                results.append({
-                    "title": title,
-                    "url": abs_url,
-                    "date_text": date_text,
-                })
-
-            except Exception:
-                continue
-
-        print(f"    [RESULT] {len(results)}件取得")
-
-    except PlaywrightTimeoutError:
-        print(f"  [WARN] タイムアウト: {url}")
-    except Exception:
-        print(f"  [ERROR] スクレイピング失敗: {url}\n{traceback.format_exc()}")
-    finally:
-        page.close()
-        context.close()
-
-    return results
-
-# ─────────────────────────────────────────────
-# ログシート書き込み
-# ─────────────────────────────────────────────
 def write_log(spreadsheet, log_rows: list):
-    sheet = get_or_create_sheet(spreadsheet, "_log")
-    header = ["実行日時", "シート名", "取得件数", "新規件数", "ステータス", "エラー詳細"]
-    existing = sheet.row_values(1)
-    if existing != header:
-        sheet.insert_row(header, index=1)
-    if log_rows:
-        sheet.append_rows(log_rows, value_input_option="USER_ENTERED")
+    try:
+        ws = spreadsheet.worksheet("取得ログ")
+    except gspread.WorksheetNotFound:
+        ws = spreadsheet.add_worksheet("取得ログ", rows=1000, cols=5)
+        ws.append_row(["取得日時", "シート名", "件数", "ステータス", "エラー"])
+    for row in log_rows:
+        ws.append_row(row)
 
-# ─────────────────────────────────────────────
-# メイン処理
-# ─────────────────────────────────────────────
-def main():
-    print(f"=== スクレイピング開始: {NOW_STR} ===")
 
-    gc = init_gspread()
-    spreadsheet = gc.open_by_key(SPREADSHEET_ID)
-    print(f"[INFO] スプレッドシートを開きました: {SPREADSHEET_ID}")
+# ──────────────────────────────────────────────
+# メイン
+# ──────────────────────────────────────────────
 
+async def main():
+    fetched_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"\n=== スクレイピング開始: {fetched_at} ===")
+
+    client = get_sheet_client()
+    spreadsheet = client.open_by_key(SPREADSHEET_ID)
     log_rows = []
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-            ],
-        )
-
-        for target in TARGETS:
-            sheet_name = target["sheet"]
+    # ── curl_cffi で mod.go.jp 4サイト ──
+    async with AsyncSession() as session:
+        mod_scrapers = [
+            ("統合幕僚監部_報道発表",   scrape_js_press),
+            ("統合幕僚監部_トピックス", scrape_js_topics),
+            ("航空自衛隊_ニュース",     scrape_asdf_news),
+            ("九州防衛局_新着",         scrape_kyushu_rdb),
+        ]
+        for sheet_name, fn in mod_scrapers:
             print(f"\n[TARGET] {sheet_name}")
-            status = "SUCCESS"
-            error_detail = ""
-            new_count = 0
-            total_count = 0
-
             try:
-                sheet = get_or_create_sheet(spreadsheet, sheet_name)
-                ensure_header(sheet)
-                existing_urls = get_existing_urls(sheet)
-
-                articles = scrape_site(browser, target)
-                total_count = len(articles)
-
-                new_rows = []
-                for article in articles:
-                    if article["url"] not in existing_urls:
-                        new_rows.append([
-                            NOW_STR,
-                            article["title"],
-                            article["url"],
-                            article["date_text"],
-                        ])
-                        new_count += 1
-
-                if new_rows:
-                    append_rows_to_sheet(sheet, new_rows)
-                    print(f"  [WRITE] {new_count}件の新規記事を書き込みました")
+                items = await fn(session)
+                if items:
+                    write_to_sheet(spreadsheet, sheet_name, items, fetched_at)
+                    log_rows.append([fetched_at, sheet_name, len(items), "success", ""])
                 else:
-                    print(f"  [SKIP] 新規記事なし")
-
-                # サイト間のアクセス間隔（Cloudflareサイトは長めに待機）
-                wait_sec = 5 if target.get("cloudflare") else 2
-                time.sleep(wait_sec)
-
+                    print("  [WARN] 0件（ブロックまたは構造変更の可能性）")
+                    log_rows.append([fetched_at, sheet_name, 0, "warn", "0件"])
             except Exception as e:
-                status = "ERROR"
-                error_detail = str(e)
-                print(f"  [ERROR] {sheet_name}: {traceback.format_exc()}")
+                print(f"  [ERROR] {e}")
+                log_rows.append([fetched_at, sheet_name, 0, "error", str(e)])
+            await asyncio.sleep(2)
 
-            log_rows.append([
-                NOW_STR,
-                sheet_name,
-                total_count,
-                new_count,
-                status,
-                error_detail,
-            ])
-
-        browser.close()
+    # ── Playwright で新富町 ──
+    print(f"\n[TARGET] 新富町_新着")
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        ctx = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
+            locale="ja-JP",
+        )
+        page = await ctx.new_page()
+        try:
+            items = await scrape_shintomi(page)
+            write_to_sheet(spreadsheet, "新富町_新着", items, fetched_at)
+            log_rows.append([fetched_at, "新富町_新着", len(items), "success", ""])
+        except Exception as e:
+            print(f"  [ERROR] {e}")
+            log_rows.append([fetched_at, "新富町_新着", 0, "error", str(e)])
+        finally:
+            await browser.close()
 
     write_log(spreadsheet, log_rows)
-    print(f"\n=== スクレイピング完了: {datetime.now(JST).strftime('%Y-%m-%d %H:%M:%S')} ===")
+    print(f"\n=== スクレイピング完了: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n")
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
