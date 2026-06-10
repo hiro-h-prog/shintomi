@@ -81,14 +81,24 @@ async def scrape_js_press(session: AsyncSession) -> list[dict]:
     result = []
     for a in soup.select("a[href]")[:80]:
         href = a.get("href", "")
-        if "/js/pdf/" not in href and "/js/press/" not in href:
+
+        # ── 修正①：PDFリンクのみ対象（index.html等のHTMLページを除外）──
+        if "/js/pdf/" not in href:
             continue
+
         text = a.get_text(" ", strip=True)
         if len(text) < 6:
             continue
+
         url = href if href.startswith("http") else "https://www.mod.go.jp" + href
+
+        # ── 修正②：日付が取れない行（インデックスページ等）を除外 ──
+        date = extract_date(text)
+        if not date:
+            continue
+
         result.append({
-            "date":  extract_date(text),
+            "date":  date,
             "title": re.sub(r'^\d{4}年\d{1,2}月\d{1,2}日\s*(公表\s*)?', '', text).strip()[:150],
             "url":   url,
         })
