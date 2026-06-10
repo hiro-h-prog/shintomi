@@ -145,7 +145,7 @@ async def scrape_rss(session: AsyncSession, url: str) -> list[dict]:
         r = await session.get(url, headers=CF_HEADERS, timeout=30, impersonate="chrome124")
         r.raise_for_status()
         # XMLとしてパース（lxml-xmlまたはhtml.parserで対応）
-        soup = BeautifulSoup(r.text, "xml") if "xml" in r.headers.get("content-type", "") else BeautifulSoup(r.text, "html.parser")
+        soup = BeautifulSoup(r.text, "lxml-xml")
         items = soup.find_all("item")
         result = []
         for item in items[:50]:
