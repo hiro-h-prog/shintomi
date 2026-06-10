@@ -31,15 +31,10 @@ async def scrape():
             wait_until="networkidle",
             timeout=30000,
         )
-
         body_text = await page.inner_text("body")
-
-        # デバッグ: bodyの最初の部分をstderrに出力
-        print(f"[DEBUG] body length: {len(body_text)}", file=sys.stderr)
-        print(f"[DEBUG] body preview:\n{body_text[:2000]}", file=sys.stderr)
-
         await browser.close()
 
+    # デバッグ: 最初の3000文字をJSONのdebugフィールドに含めて返す
     result = []
     seen = set()
     date_pattern = re.compile(r'\d{4}年\d{1,2}月\d{1,2}日')
@@ -53,21 +48,25 @@ async def scrape():
         if line in seen:
             continue
         seen.add(line)
-
         date = extract_date(line)
         title = re.sub(r'^\d{4}年\d{1,2}月\d{1,2}日\s*', '', line).strip()
         m_title = re.search(r'[『「](.+?)[』」]', title)
         if m_title:
             title = m_title.group(1)
-
         if not title:
             continue
-
         result.append({"date": date, "title": title[:150], "url": ""})
         if len(result) >= 30:
             break
 
-    print(json.dumps(result, ensure_ascii=False))
+    # デバッグ情報をダミーアイテムとして先頭に追加
+    debug_info = {
+        "date": "DEBUG",
+        "title": f"body_len={len(body_text)} preview={body_text[:500].replace(chr(10),' ')}",
+        "url": ""
+    }
+    output = [debug_info] + result
+    print(json.dumps(output, ensure_ascii=False))
 
 if __name__ == "__main__":
     asyncio.run(scrape())
