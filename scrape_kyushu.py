@@ -1,8 +1,6 @@
 # -*- coding: utf-8 -*-
 """
 九州防衛局 新着情報スクレイパー — Playwright専用（別プロセスで実行）
-scrape.py から subprocess で呼び出される
-結果はJSON形式で stdout に出力する
 """
 
 import asyncio
@@ -34,30 +32,23 @@ async def scrape():
             timeout=30000,
         )
 
-        # 新着情報セクションを取得
-        # 「ここから新着情報です」のアンカー以降の要素を対象にする
-        items_raw = await page.eval_on_selector_all(
-            "a[href]",
-            """els => els.map(a => {
-                const text = a.innerText.trim().replace(/\\s+/g, ' ');
-                return { title: text, url: a.href };
-            }).filter(x => x.title.length > 5)"""
-        )
-
-        # ページ全体テキストから日付行を抽出（JSレンダリング後）
         body_text = await page.inner_text("body")
+
+        # デバッグ: bodyの最初の部分をstderrに出力
+        print(f"[DEBUG] body length: {len(body_text)}", file=sys.stderr)
+        print(f"[DEBUG] body preview:\n{body_text[:2000]}", file=sys.stderr)
+
         await browser.close()
 
     result = []
     seen = set()
-    date_pattern = re.compile(r'(\d{4}年\d{1,2}月\d{1,2}日)')
+    date_pattern = re.compile(r'\d{4}年\d{1,2}月\d{1,2}日')
 
-    # 日付を含む行を抽出
     for line in body_text.split("\n"):
         line = line.strip()
         if not date_pattern.search(line):
             continue
-        if len(line) < 15 or len(line) > 300:
+        if len(line) < 10 or len(line) > 400:
             continue
         if line in seen:
             continue
@@ -65,19 +56,14 @@ async def scrape():
 
         date = extract_date(line)
         title = re.sub(r'^\d{4}年\d{1,2}月\d{1,2}日\s*', '', line).strip()
-        # 『』で囲まれたタイトル部分を優先抽出
-        m = re.search(r'[『「](.+?)[』」]', title)
-        if m:
-            title = m.group(1)
+        m_title = re.search(r'[『「](.+?)[』」]', title)
+        if m_title:
+            title = m_title.group(1)
 
-        # 対応するURLをリンクリストから探す
-        url = ""
-        for item in items_raw:
-            if title[:20] in item["title"] or item["title"][:20] in title:
-                url = item["url"]
-                break
+        if not title:
+            continue
 
-        result.append({"date": date, "title": title[:150], "url": url})
+        result.append({"date": date, "title": title[:150], "url": ""})
         if len(result) >= 30:
             break
 
