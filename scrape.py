@@ -3,8 +3,8 @@
 防衛関連サイト スクレイピング → Google Sheets 書き込み
 GitHub Actions セルフホストランナー（Windows）から実行する
 
-mod.go.jp … curl_cffi で Cloudflare を回避（SelectorEventLoop必須）
-新富町    … scrape_shintomi.py を別プロセスで呼び出し（PlaywrightはProactorEventLoop必須）
+mod.go.jp（報道発表・トピックス・航空ニュース） … curl_cffi
+九州防衛局・新富町 … Playwright別プロセス
 """
 
 import asyncio
@@ -19,7 +19,6 @@ from bs4 import BeautifulSoup
 from google.oauth2.service_account import Credentials
 import gspread
 
-# Windows: 文字化け対策 + curl_cffi 用に SelectorEventLoop を設定
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
@@ -46,7 +45,7 @@ def get_sheet_client():
 
 
 # ──────────────────────────────────────────────
-# mod.go.jp 系: curl_cffi で Cloudflare を回避
+# curl_cffi 系
 # ──────────────────────────────────────────────
 
 async def fetch_html(session: AsyncSession, url: str) -> BeautifulSoup | None:
@@ -61,6 +60,18 @@ async def fetch_html(session: AsyncSession, url: str) -> BeautifulSoup | None:
 def extract_date(text: str) -> str:
     m = re.search(r'(\d{4}年\d{1,2}月\d{1,2}日|\d{4}\.\d{1,2}\.\d{1,2}|\d{4}[-/]\d{1,2}[-/]\d{1,2})', text)
     return m.group(1) if m else ""
+
+def date_from_filename(url: str) -> str:
+    """航空自衛隊のURLファイル名（例: 20260603.pdf）から日付を抽出"""
+    m = re.search(r'/(\d{4})(\d{2})(\d{2})', url)
+    return f"{m.group(1)}年{int(m.group(2)):02d}月{int(m.group(3)):02d}日" if m else ""
+
+# ナビゲーション等に頻出するノイズテキスト（前方一致）
+NAV_PREFIXES = (
+    "統合幕僚監部について", "活動情報", "フォトギャラリー", "調達情報",
+    "報道発表", "HOME", "トップ", "サイトマップ", "お問い合わせ",
+    "文字サイズ", "English", "ページトップ",
+)
 
 async def scrape_js_press(session: AsyncSession) -> list[dict]:
     """統合幕僚監部 報道発表資料"""
@@ -84,25 +95,33 @@ async def scrape_js_press(session: AsyncSession) -> list[dict]:
     return result[:50]
 
 async def scrape_js_topics(session: AsyncSession) -> list[dict]:
-    """統合幕僚監部 出来事（トピックス）"""
+    """統合幕僚監部 出来事（トピックス）— ナビノイズを除去"""
     soup = await fetch_html(session, "https://www.mod.go.jp/js/about/topics.html")
     if not soup:
         return []
     result = []
+    seen = set()
     for tag in soup.select("li, p, dt, dd"):
         text = tag.get_text(" ", strip=True)
-        if len(text) < 15 or len(text) > 300:
+        # ノイズ除去: 短すぎ・長すぎ・ナビ系・重複
+        if len(text) < 20 or len(text) > 400:
             continue
+        if any(text.startswith(p) for p in NAV_PREFIXES):
+            continue
+        key = text[:40]
+        if key in seen:
+            continue
+        seen.add(key)
         a = tag.find("a")
         href = a["href"] if a and a.get("href") else ""
         url = ("https://www.mod.go.jp" + href) if href and not href.startswith("http") else href
         result.append({"date": extract_date(text), "title": text[:150], "url": url})
-        if len(result) >= 30:
+        if len(result) >= 20:
             break
     return result
 
 async def scrape_asdf_news(session: AsyncSession) -> list[dict]:
-    """航空自衛隊 ニュース"""
+    """航空自衛隊 ニュース — URLのファイル名から日付を補完"""
     soup = await fetch_html(session, "https://www.mod.go.jp/asdf/news/")
     if not soup:
         return []
@@ -115,78 +134,18 @@ async def scrape_asdf_news(session: AsyncSession) -> list[dict]:
         if len(text) < 6:
             continue
         url = href if href.startswith("http") else "https://www.mod.go.jp" + href
-        result.append({"date": extract_date(text), "title": text[:150], "url": url})
-    return result[:50]
-
-async def scrape_kyushu_rdb(session: AsyncSession) -> list[dict]:
-    """九州防衛局 新着情報
-    トップページの新着セクションをテキストパースで取得する。
-    JSレンダリングなしで日付+タイトルのパターンを抽出。
-    """
-    base = "https://www.mod.go.jp/rdb/kyushu"
-    soup = await fetch_html(session, base + "/index.html")
-    if not soup:
-        return []
-
-    result = []
-
-    # 方法①: 新着セクション内の <li> や <dd> から日付＋リンクを抽出
-    # 九州防衛局のトップは「新着情報」セクションに日付テキスト＋aタグが並ぶ構造
-    DATE_PATTERN = re.compile(r'(\d{4}年\d{1,2}月\d{1,2}日)')
-
-    # 日付テキストを含む親要素を探す
-    for elem in soup.find_all(["li", "dd", "p", "div", "tr"])[:300]:
-        text = elem.get_text(" ", strip=True)
-        if not DATE_PATTERN.search(text):
-            continue
-        if len(text) < 10 or len(text) > 400:
-            continue
-
-        a = elem.find("a", href=True)
-        href = a["href"].strip() if a else ""
-        if href.startswith("http"):
-            url = href
-        elif href.startswith("/"):
-            url = "https://www.mod.go.jp" + href
-        elif href:
-            url = base + "/" + href
-        else:
-            url = ""
-
-        date = extract_date(text)
-        title = re.sub(r'^\d{4}年\d{1,2}月\d{1,2}日\s*[『「]?', '', text).strip()
-        title = re.sub(r'[』」].*$', '', title).strip()
-        if not title:
-            continue
-
-        result.append({"date": date, "title": title[:150], "url": url})
-        if len(result) >= 50:
-            break
-
-    # 方法②: 上記で取れなかった場合、全文から日付行を抽出
-    if not result:
-        body_text = soup.get_text("\n")
-        for line in body_text.split("\n"):
-            line = line.strip()
-            if not DATE_PATTERN.search(line) or len(line) < 15:
-                continue
-            date = extract_date(line)
-            title = re.sub(r'^\d{4}年\d{1,2}月\d{1,2}日\s*', '', line).strip()[:150]
-            result.append({"date": date, "title": title, "url": ""})
-            if len(result) >= 30:
-                break
-
+        # テキストに日付がなければURLファイル名から取得
+        date = extract_date(text) or date_from_filename(url)
+        result.append({"date": date, "title": text[:150], "url": url})
     return result[:50]
 
 
 # ──────────────────────────────────────────────
-# 新富町: 別プロセス（scrape_shintomi.py）で実行
-# PlaywrightはProactorEventLoopが必要なため分離
+# Playwright別プロセス系
 # ──────────────────────────────────────────────
 
-def scrape_shintomi_subprocess() -> list[dict]:
-    """scrape_shintomi.py を別プロセスで実行してJSONを受け取る"""
-    script = os.path.join(os.path.dirname(__file__), "scrape_shintomi.py")
+def run_subprocess(script_name: str) -> list[dict]:
+    script = os.path.join(os.path.dirname(__file__), script_name)
     proc = subprocess.run(
         [sys.executable, script],
         capture_output=True,
@@ -195,7 +154,7 @@ def scrape_shintomi_subprocess() -> list[dict]:
         timeout=60,
     )
     if proc.returncode != 0:
-        raise RuntimeError(f"scrape_shintomi.py failed:\n{proc.stderr}")
+        raise RuntimeError(f"{script_name} failed:\n{proc.stderr[-500:]}")
     return json.loads(proc.stdout.strip())
 
 
@@ -237,13 +196,12 @@ async def main():
     spreadsheet = client.open_by_key(SPREADSHEET_ID)
     log_rows = []
 
-    # curl_cffi で mod.go.jp 4サイト
+    # curl_cffi で3サイト
     async with AsyncSession() as session:
         mod_scrapers = [
             ("統合幕僚監部_報道発表",   scrape_js_press),
             ("統合幕僚監部_トピックス", scrape_js_topics),
             ("航空自衛隊_ニュース",     scrape_asdf_news),
-            ("九州防衛局_新着",         scrape_kyushu_rdb),
         ]
         for sheet_name, fn in mod_scrapers:
             print(f"\n[TARGET] {sheet_name}")
@@ -260,15 +218,19 @@ async def main():
                 log_rows.append([fetched_at, sheet_name, 0, "error", str(e)])
             await asyncio.sleep(2)
 
-    # 新富町: 別プロセスで実行
-    print(f"\n[TARGET] 新富町_新着")
-    try:
-        items = scrape_shintomi_subprocess()
-        write_to_sheet(spreadsheet, "新富町_新着", items, fetched_at)
-        log_rows.append([fetched_at, "新富町_新着", len(items), "success", ""])
-    except Exception as e:
-        print(f"  [ERROR] {e}")
-        log_rows.append([fetched_at, "新富町_新着", 0, "error", str(e)])
+    # Playwright別プロセスで2サイト
+    for sheet_name, script in [
+        ("九州防衛局_新着", "scrape_kyushu.py"),
+        ("新富町_新着",     "scrape_shintomi.py"),
+    ]:
+        print(f"\n[TARGET] {sheet_name}")
+        try:
+            items = run_subprocess(script)
+            write_to_sheet(spreadsheet, sheet_name, items, fetched_at)
+            log_rows.append([fetched_at, sheet_name, len(items), "success", ""])
+        except Exception as e:
+            print(f"  [ERROR] {e}")
+            log_rows.append([fetched_at, sheet_name, 0, "error", str(e)])
 
     write_log(spreadsheet, log_rows)
     print(f"\n=== スクレイピング完了: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n")
