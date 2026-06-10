@@ -134,10 +134,44 @@ async def scrape_asdf_news(session: AsyncSession) -> list[dict]:
         if len(text) < 6:
             continue
         url = href if href.startswith("http") else "https://www.mod.go.jp" + href
-        # テキストに日付がなければURLファイル名から取得
         date = extract_date(text) or date_from_filename(url)
         result.append({"date": date, "title": text[:150], "url": url})
     return result[:50]
+
+
+async def scrape_rss(session: AsyncSession, url: str) -> list[dict]:
+    """防衛省RSSフィードを取得してパース"""
+    try:
+        r = await session.get(url, headers=CF_HEADERS, timeout=30, impersonate="chrome124")
+        r.raise_for_status()
+        # XMLとしてパース（lxml-xmlまたはhtml.parserで対応）
+        soup = BeautifulSoup(r.text, "xml") if "xml" in r.headers.get("content-type", "") else BeautifulSoup(r.text, "html.parser")
+        items = soup.find_all("item")
+        result = []
+        for item in items[:50]:
+            title = item.find("title")
+            link  = item.find("link")
+            pub   = item.find("pubDate") or item.find("dc:date") or item.find("date")
+            title_text = title.get_text(strip=True) if title else ""
+            link_text  = link.get_text(strip=True) if link else ""
+            pub_text   = pub.get_text(strip=True) if pub else ""
+            # pubDateは "Wed, 04 Jun 2026 00:00:00 +0900" 形式なので変換
+            date = ""
+            if pub_text:
+                m = re.search(r'(\d{1,2})\s+(\w+)\s+(\d{4})', pub_text)
+                if m:
+                    month_map = {"Jan":"1","Feb":"2","Mar":"3","Apr":"4","May":"5","Jun":"6",
+                                 "Jul":"7","Aug":"8","Sep":"9","Oct":"10","Nov":"11","Dec":"12"}
+                    mon = month_map.get(m.group(2), m.group(2))
+                    date = f"{m.group(3)}年{int(mon):02d}月{int(m.group(1)):02d}日"
+                else:
+                    date = extract_date(pub_text)
+            if title_text:
+                result.append({"date": date, "title": title_text[:150], "url": link_text})
+        return result
+    except Exception as e:
+        print(f"    [ERROR] RSS {url}: {e}")
+        return []
 
 
 # ──────────────────────────────────────────────
@@ -196,12 +230,14 @@ async def main():
     spreadsheet = client.open_by_key(SPREADSHEET_ID)
     log_rows = []
 
-    # curl_cffi で3サイト
+    # curl_cffi で5サイト（HTML3件 + RSS2件）
     async with AsyncSession() as session:
         mod_scrapers = [
             ("統合幕僚監部_報道発表",   scrape_js_press),
             ("統合幕僚監部_トピックス", scrape_js_topics),
             ("航空自衛隊_ニュース",     scrape_asdf_news),
+            ("防衛省_更新情報RSS",      lambda s: scrape_rss(s, "https://www.mod.go.jp/j/rss/update.xml")),
+            ("防衛省_ニュースRSS",      lambda s: scrape_rss(s, "https://www.mod.go.jp/j/rss/news.xml")),
         ]
         for sheet_name, fn in mod_scrapers:
             print(f"\n[TARGET] {sheet_name}")
