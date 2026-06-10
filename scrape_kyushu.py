@@ -15,9 +15,44 @@ if sys.platform == "win32":
 
 from playwright.async_api import async_playwright
 
+# ノイズとして除外するタイトルの完全一致リスト
+NOISE_TITLES = {
+    "トピックス",
+    "お知らせ",
+    "新着情報",
+    "更新情報",
+    "ニュース",
+    "HOME",
+    "トップ",
+    "サイトマップ",
+    "お問い合わせ",
+}
+
+# ノイズとして除外するタイトルの前方一致リスト
+NOISE_PREFIXES = (
+    "ページトップ",
+    "文字サイズ",
+    "English",
+    "メニュー",
+    "ナビ",
+)
+
 def extract_date(text: str) -> str:
     m = re.search(r'(\d{4}年\d{1,2}月\d{1,2}日)', text)
     return m.group(1) if m else ""
+
+def is_noise_title(title: str) -> bool:
+    """ナビゲーション系・汎用的すぎるタイトルを判定"""
+    # 短すぎる
+    if len(title) < 6:
+        return True
+    # 完全一致ノイズ
+    if title in NOISE_TITLES:
+        return True
+    # 前方一致ノイズ
+    if any(title.startswith(p) for p in NOISE_PREFIXES):
+        return True
+    return False
 
 async def scrape():
     async with async_playwright() as p:
@@ -63,6 +98,11 @@ async def scrape():
                 title = m.group(1) if m else title_line
                 title = title.strip()[:150]
 
+                # ── ノイズフィルタ ──
+                if is_noise_title(title):
+                    i += 2
+                    continue
+
                 if title and title not in seen:
                     seen.add(title)
                     # 対応URLをリンクリストから探す
@@ -72,6 +112,12 @@ async def scrape():
                             if "mod.go.jp/rdb/kyushu" in link["url"]:
                                 url = link["url"]
                                 break
+
+                    # ── URLなし＋汎用タイトルの場合はスキップ ──
+                    if not url and len(title) < 15:
+                        i += 2
+                        continue
+
                     result.append({"date": date, "title": title, "url": url})
             i += 2
         else:
