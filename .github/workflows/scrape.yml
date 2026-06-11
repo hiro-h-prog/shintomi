@@ -2,9 +2,7 @@ name: 防衛関連サイト スクレイピング
 
 on:
   schedule:
-    - cron: "0 23 * * *"   # 08:00 JST
     - cron: "0 3 * * *"    # 12:00 JST
-    - cron: "0 9 * * *"    # 18:00 JST
   workflow_dispatch:
 
 jobs:
