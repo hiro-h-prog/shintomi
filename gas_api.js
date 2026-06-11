@@ -100,6 +100,7 @@ function getNewItemsAndLog(maxRows) {
         date:       row[1] ? String(row[1]) : "",
         title:      title,
         url:        url,
+        body:       row[4] ? String(row[4]) : "",
       });
 
       if (newItems.length >= maxRows) break;
@@ -171,6 +172,7 @@ function getSummary(maxRows) {
       date:       String(r[1] || ""),
       title:      String(r[2] || ""),
       url:        String(r[3] || ""),
+      body:       String(r[4] || ""),
     })).filter(r => r.title && r.title !== "取得日時");
 
     summary.push({ sheet: name, items: rows });
