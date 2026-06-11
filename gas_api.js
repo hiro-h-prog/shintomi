@@ -2,9 +2,6 @@
  * 防衛関連情報 スプレッドシート読み取りAPI v2
  * - 前回Difyに送信した日時を「送信ログ」シートに記録
  * - 次回以降は新規データのみ返す
- *
- * デプロイ:「デプロイ」→「新しいデプロイ」→「ウェブアプリ」
- * 実行ユーザー: 自分 ／ アクセス: 全員
  */
 
 const SPREADSHEET_ID = "1QO0alKXYlWJVY9S8SlFCDSXmlOVrgSx7cgA2XiNZJwg";
@@ -82,32 +79,43 @@ function getNewItemsAndLog(maxRows) {
 
     // ヘッダー行をスキップしてデータ取得
     // カラム: [取得日時, 日付, タイトル, URL]
-    const lastSent = lastSentMap[name] || null;
+    // 送信済みURLセットを取得（URLがないものはタイトルで管理）
+    const sentKeys = getSentKeys(logSheet, name);
 
     const newItems = [];
     for (let i = 1; i < data.length; i++) {
       const row = data[i];
       const fetchedAt = row[0] ? String(row[0]) : "";
-      const title = row[2] ? String(row[2]) : "";
+      const title     = row[2] ? String(row[2]) : "";
+      const url       = row[3] ? String(row[3]) : "";
 
       if (!title || title === "取得日時") continue;
 
-      // 前回送信日時より新しいデータのみ
-      if (lastSent && fetchedAt <= lastSent) continue;
+      // URLがあればURLで、なければタイトルで重複チェック
+      const key = url || title;
+      if (sentKeys.has(key)) continue;
 
       newItems.push({
         fetched_at: fetchedAt,
         date:       row[1] ? String(row[1]) : "",
         title:      title,
-        url:        row[3] ? String(row[3]) : "",
+        url:        url,
       });
 
       if (newItems.length >= maxRows) break;
     }
 
-    // 送信ログに記録
+    // 今回送信したキーを送信ログに記録
     const latestDate = newItems.length > 0 ? newItems[0].date : "";
-    logSheet.appendRow([sentAt, name, newItems.length, latestDate]);
+    for (const item of newItems) {
+      const key = item.url || item.title;
+      logSheet.appendRow([sentAt, name, key, item.date]);
+    }
+    // 件数サマリーも別途記録
+    if (newItems.length === 0) {
+      // 新規なしの記録（確認用）
+      logSheet.appendRow([sentAt, name, "(新規なし)", ""]);
+    }
 
     totalNew += newItems.length;
     results.push({ sheet: name, new_count: newItems.length, items: newItems });
@@ -132,21 +140,18 @@ function getNewItemsAndLog(maxRows) {
 
 
 /**
- * 送信ログからシートごとの最終送信日時を取得
+ * 送信ログから指定シートの送信済みキー（URL or タイトル）セットを取得
  */
-function getLastSentMap(logSheet) {
+function getSentKeys(logSheet, sheetName) {
   const data = logSheet.getDataRange().getValues();
-  const map = {};
-
-  // 最新順に走査してシートごとの最終送信日時を取得
-  for (let i = data.length - 1; i >= 1; i--) {
-    const sentAt  = String(data[i][0]);
-    const sheetName = String(data[i][1]);
-    if (!map[sheetName]) {
-      map[sheetName] = sentAt;
+  const keys = new Set();
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][1]) === sheetName) {
+      const key = String(data[i][2]);
+      if (key && key !== "(新規なし)") keys.add(key);
     }
   }
-  return map;
+  return keys;
 }
 
 
@@ -208,7 +213,7 @@ function resetSendLog() {
   let sheet = ss.getSheetByName(SEND_LOG_SHEET);
   if (sheet) {
     sheet.clearContents();
-    sheet.appendRow(["送信日時", "シート名", "件数", "最新データ日付"]);
+    sheet.appendRow(["送信日時", "シート名", "送信キー(URL or タイトル)", "日付"]);
   }
   return { result: "送信ログをリセットしました" };
 }
