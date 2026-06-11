@@ -3,8 +3,9 @@
 防衛関連サイト スクレイピング → Google Sheets 書き込み
 GitHub Actions セルフホストランナー（Windows）から実行する
 
-mod.go.jp（報道発表・トピックス・航空ニュース） … curl_cffi
+mod.go.jp（報道発表・トピックス・航空ニュース・RSS） … curl_cffi
 九州防衛局・新富町 … Playwright別プロセス
+防衛省RSS・九州防衛局 … 本文も取得してシートに保存
 """
 
 import asyncio
@@ -34,6 +35,13 @@ CF_HEADERS = {
     "Upgrade-Insecure-Requests": "1",
 }
 
+# 本文取得時に除去するノイズセレクタ
+NOISE_SELECTORS = [
+    "header", "footer", "nav", ".breadcrumb", "#breadcrumb",
+    ".side", "#side", ".menu", "#menu", ".gnav", "#gnav",
+    "script", "style", "noscript",
+]
+
 def get_sheet_client():
     creds_data = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
     scopes = [
@@ -62,11 +70,34 @@ def extract_date(text: str) -> str:
     return m.group(1) if m else ""
 
 def date_from_filename(url: str) -> str:
-    """航空自衛隊のURLファイル名（例: 20260603.pdf）から日付を抽出"""
     m = re.search(r'/(\d{4})(\d{2})(\d{2})', url)
     return f"{m.group(1)}年{int(m.group(2)):02d}月{int(m.group(3)):02d}日" if m else ""
 
-# ナビゲーション等に頻出するノイズテキスト（前方一致）
+def extract_body_text(soup: BeautifulSoup, max_chars: int = 1000) -> str:
+    """HTMLからノイズを除去して本文テキストを抽出"""
+    for selector in NOISE_SELECTORS:
+        for tag in soup.select(selector):
+            tag.decompose()
+    # メインコンテンツ候補を優先
+    for selector in ["main", "#main", ".main", "#content", ".content", "article", ".article"]:
+        main = soup.select_one(selector)
+        if main:
+            text = main.get_text("\n", strip=True)
+            if len(text) > 100:
+                return re.sub(r'\n{3,}', '\n\n', text)[:max_chars]
+    # フォールバック: body全体
+    text = soup.get_text("\n", strip=True)
+    return re.sub(r'\n{3,}', '\n\n', text)[:max_chars]
+
+async def fetch_body(session: AsyncSession, url: str) -> str:
+    """URLから本文テキストを取得（PDFはスキップ）"""
+    if not url or url.endswith(".pdf"):
+        return ""
+    soup = await fetch_html(session, url)
+    if not soup:
+        return ""
+    return extract_body_text(soup)
+
 NAV_PREFIXES = (
     "統合幕僚監部について", "活動情報", "フォトギャラリー", "調達情報",
     "報道発表", "HOME", "トップ", "サイトマップ", "お問い合わせ",
@@ -74,38 +105,30 @@ NAV_PREFIXES = (
 )
 
 async def scrape_js_press(session: AsyncSession) -> list[dict]:
-    """統合幕僚監部 報道発表資料"""
     soup = await fetch_html(session, "https://www.mod.go.jp/js/press/index.html")
     if not soup:
         return []
     result = []
     for a in soup.select("a[href]")[:80]:
         href = a.get("href", "")
-
-        # ── 修正①：PDFリンクのみ対象（index.html等のHTMLページを除外）──
-        if "/js/pdf/" not in href:
+        if "/js/pdf/" not in href and "/js/press/" not in href:
             continue
-
         text = a.get_text(" ", strip=True)
         if len(text) < 6:
             continue
-
         url = href if href.startswith("http") else "https://www.mod.go.jp" + href
-
-        # ── 修正②：日付が取れない行（インデックスページ等）を除外 ──
         date = extract_date(text)
         if not date:
             continue
-
         result.append({
             "date":  date,
             "title": re.sub(r'^\d{4}年\d{1,2}月\d{1,2}日\s*(公表\s*)?', '', text).strip()[:150],
             "url":   url,
+            "body":  "",
         })
     return result[:50]
 
 async def scrape_js_topics(session: AsyncSession) -> list[dict]:
-    """統合幕僚監部 出来事（トピックス）— ナビノイズを除去"""
     soup = await fetch_html(session, "https://www.mod.go.jp/js/about/topics.html")
     if not soup:
         return []
@@ -113,7 +136,6 @@ async def scrape_js_topics(session: AsyncSession) -> list[dict]:
     seen = set()
     for tag in soup.select("li, p, dt, dd"):
         text = tag.get_text(" ", strip=True)
-        # ノイズ除去: 短すぎ・長すぎ・ナビ系・重複
         if len(text) < 20 or len(text) > 400:
             continue
         if any(text.startswith(p) for p in NAV_PREFIXES):
@@ -125,13 +147,12 @@ async def scrape_js_topics(session: AsyncSession) -> list[dict]:
         a = tag.find("a")
         href = a["href"] if a and a.get("href") else ""
         url = ("https://www.mod.go.jp" + href) if href and not href.startswith("http") else href
-        result.append({"date": extract_date(text), "title": text[:150], "url": url})
+        result.append({"date": extract_date(text), "title": text[:150], "url": url, "body": ""})
         if len(result) >= 20:
             break
     return result
 
 async def scrape_asdf_news(session: AsyncSession) -> list[dict]:
-    """航空自衛隊 ニュース — URLのファイル名から日付を補完"""
     soup = await fetch_html(session, "https://www.mod.go.jp/asdf/news/")
     if not soup:
         return []
@@ -145,16 +166,14 @@ async def scrape_asdf_news(session: AsyncSession) -> list[dict]:
             continue
         url = href if href.startswith("http") else "https://www.mod.go.jp" + href
         date = extract_date(text) or date_from_filename(url)
-        result.append({"date": date, "title": text[:150], "url": url})
+        result.append({"date": date, "title": text[:150], "url": url, "body": ""})
     return result[:50]
 
-
 async def scrape_rss(session: AsyncSession, url: str) -> list[dict]:
-    """防衛省RSSフィードを取得してパース"""
+    """防衛省RSSフィードを取得してパース（本文も取得）"""
     try:
         r = await session.get(url, headers=CF_HEADERS, timeout=30, impersonate="chrome124")
         r.raise_for_status()
-        # XMLとしてパース（lxml-xmlまたはhtml.parserで対応）
         soup = BeautifulSoup(r.text, "lxml-xml")
         items = soup.find_all("item")
         result = []
@@ -165,7 +184,6 @@ async def scrape_rss(session: AsyncSession, url: str) -> list[dict]:
             title_text = title.get_text(strip=True) if title else ""
             link_text  = link.get_text(strip=True) if link else ""
             pub_text   = pub.get_text(strip=True) if pub else ""
-            # pubDateは "Wed, 04 Jun 2026 00:00:00 +0900" 形式なので変換
             date = ""
             if pub_text:
                 m = re.search(r'(\d{1,2})\s+(\w+)\s+(\d{4})', pub_text)
@@ -177,11 +195,21 @@ async def scrape_rss(session: AsyncSession, url: str) -> list[dict]:
                 else:
                     date = extract_date(pub_text)
             if title_text:
-                result.append({"date": date, "title": title_text[:150], "url": link_text})
+                result.append({"date": date, "title": title_text[:150], "url": link_text, "body": ""})
         return result
     except Exception as e:
         print(f"    [ERROR] RSS {url}: {e}")
         return []
+
+async def fetch_bodies_for_rss(session: AsyncSession, items: list[dict], max_items: int = 20) -> list[dict]:
+    """RSS記事の本文を取得（新着上位N件のみ）"""
+    for i, item in enumerate(items[:max_items]):
+        url = item.get("url", "")
+        if url and not url.endswith(".pdf"):
+            print(f"    [BODY] {i+1}/{min(max_items, len(items))} {url[:60]}")
+            item["body"] = await fetch_body(session, url)
+            await asyncio.sleep(1)
+    return items
 
 
 # ──────────────────────────────────────────────
@@ -195,7 +223,7 @@ def run_subprocess(script_name: str) -> list[dict]:
         capture_output=True,
         text=True,
         encoding="utf-8",
-        timeout=60,
+        timeout=120,
     )
     if proc.returncode != 0:
         raise RuntimeError(f"{script_name} failed:\n{proc.stderr[-500:]}")
@@ -203,20 +231,34 @@ def run_subprocess(script_name: str) -> list[dict]:
 
 
 # ──────────────────────────────────────────────
-# Sheets 書き込み
+# Sheets 書き込み（本文列を追加）
 # ──────────────────────────────────────────────
 
-def write_to_sheet(spreadsheet, sheet_name: str, items: list[dict], fetched_at: str):
+def write_to_sheet(spreadsheet, sheet_name: str, items: list[dict], fetched_at: str, with_body: bool = False):
     try:
         ws = spreadsheet.worksheet(sheet_name)
         ws.clear()
     except gspread.WorksheetNotFound:
-        ws = spreadsheet.add_worksheet(sheet_name, rows=500, cols=4)
-    rows = [["取得日時", "日付", "タイトル", "URL"]]
-    for item in items:
-        rows.append([fetched_at, item.get("date",""), item.get("title",""), item.get("url","")])
+        cols = 5 if with_body else 4
+        ws = spreadsheet.add_worksheet(sheet_name, rows=500, cols=cols)
+
+    if with_body:
+        rows = [["取得日時", "日付", "タイトル", "URL", "本文"]]
+        for item in items:
+            rows.append([
+                fetched_at,
+                item.get("date", ""),
+                item.get("title", ""),
+                item.get("url", ""),
+                item.get("body", ""),
+            ])
+    else:
+        rows = [["取得日時", "日付", "タイトル", "URL"]]
+        for item in items:
+            rows.append([fetched_at, item.get("date",""), item.get("title",""), item.get("url","")])
+
     ws.update(rows, "A1")
-    print(f"  [WRITE] {sheet_name}: {len(items)}件")
+    print(f"  [WRITE] {sheet_name}: {len(items)}件{'（本文あり）' if with_body else ''}")
 
 def write_log(spreadsheet, log_rows: list):
     try:
@@ -240,21 +282,19 @@ async def main():
     spreadsheet = client.open_by_key(SPREADSHEET_ID)
     log_rows = []
 
-    # curl_cffi で5サイト（HTML3件 + RSS2件）
     async with AsyncSession() as session:
-        mod_scrapers = [
+
+        # ── 本文不要の3サイト ──
+        for sheet_name, fn in [
             ("統合幕僚監部_報道発表",   scrape_js_press),
             ("統合幕僚監部_トピックス", scrape_js_topics),
             ("航空自衛隊_ニュース",     scrape_asdf_news),
-            ("防衛省_更新情報RSS",      lambda s: scrape_rss(s, "https://www.mod.go.jp/j/rss/update.xml")),
-            ("防衛省_ニュースRSS",      lambda s: scrape_rss(s, "https://www.mod.go.jp/j/rss/news.xml")),
-        ]
-        for sheet_name, fn in mod_scrapers:
+        ]:
             print(f"\n[TARGET] {sheet_name}")
             try:
                 items = await fn(session)
                 if items:
-                    write_to_sheet(spreadsheet, sheet_name, items, fetched_at)
+                    write_to_sheet(spreadsheet, sheet_name, items, fetched_at, with_body=False)
                     log_rows.append([fetched_at, sheet_name, len(items), "success", ""])
                 else:
                     print("  [WARN] 0件")
@@ -264,15 +304,37 @@ async def main():
                 log_rows.append([fetched_at, sheet_name, 0, "error", str(e)])
             await asyncio.sleep(2)
 
-    # Playwright別プロセスで2サイト
-    for sheet_name, script in [
-        ("九州防衛局_新着", "scrape_kyushu.py"),
-        ("新富町_新着",     "scrape_shintomi.py"),
+        # ── 本文あり: 防衛省RSS 2件 ──
+        for sheet_name, rss_url in [
+            ("防衛省_更新情報RSS", "https://www.mod.go.jp/j/rss/update.xml"),
+            ("防衛省_ニュースRSS", "https://www.mod.go.jp/j/rss/news.xml"),
+        ]:
+            print(f"\n[TARGET] {sheet_name}（本文取得あり）")
+            try:
+                items = await scrape_rss(session, rss_url)
+                if items:
+                    # 本文取得（上位20件）
+                    items = await fetch_bodies_for_rss(session, items, max_items=20)
+                    write_to_sheet(spreadsheet, sheet_name, items, fetched_at, with_body=True)
+                    log_rows.append([fetched_at, sheet_name, len(items), "success", ""])
+                else:
+                    print("  [WARN] 0件")
+                    log_rows.append([fetched_at, sheet_name, 0, "warn", "0件"])
+            except Exception as e:
+                print(f"  [ERROR] {e}")
+                log_rows.append([fetched_at, sheet_name, 0, "error", str(e)])
+            await asyncio.sleep(2)
+
+    # ── Playwright別プロセス ──
+    # 九州防衛局は scrape_kyushu.py 側で本文も取得
+    for sheet_name, script, with_body in [
+        ("九州防衛局_新着", "scrape_kyushu.py",   True),
+        ("新富町_新着",     "scrape_shintomi.py",  False),
     ]:
         print(f"\n[TARGET] {sheet_name}")
         try:
             items = run_subprocess(script)
-            write_to_sheet(spreadsheet, sheet_name, items, fetched_at)
+            write_to_sheet(spreadsheet, sheet_name, items, fetched_at, with_body=with_body)
             log_rows.append([fetched_at, sheet_name, len(items), "success", ""])
         except Exception as e:
             print(f"  [ERROR] {e}")
