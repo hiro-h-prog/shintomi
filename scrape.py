@@ -182,7 +182,14 @@ async def scrape_rss(session: AsyncSession, url: str) -> list[dict]:
             link  = item.find("link")
             pub   = item.find("pubDate") or item.find("dc:date") or item.find("date")
             title_text = title.get_text(strip=True) if title else ""
-            link_text  = link.get_text(strip=True) if link else ""
+            # linkタグはBeautifulSoup(lxml-xml)では次の兄弟テキストノードになる場合がある
+            if link:
+                link_text = link.get_text(strip=True)
+                # 相対URLの場合は絶対URLに補完
+                if link_text and not link_text.startswith("http"):
+                    link_text = "https://www.mod.go.jp" + link_text
+            else:
+                link_text = ""
             pub_text   = pub.get_text(strip=True) if pub else ""
             date = ""
             if pub_text:
