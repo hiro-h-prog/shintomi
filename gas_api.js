@@ -2,6 +2,9 @@
  * 防衛関連情報 スプレッドシート読み取りAPI v2
  * - 前回Difyに送信した日時を「送信ログ」シートに記録
  * - 次回以降は新規データのみ返す
+ *
+ * デプロイ:「デプロイ」→「新しいデプロイ」→「ウェブアプリ」
+ * 実行ユーザー: 自分 ／ アクセス: 全員
  */
 
 const SPREADSHEET_ID = "1QO0alKXYlWJVY9S8SlFCDSXmlOVrgSx7cgA2XiNZJwg";
@@ -63,9 +66,6 @@ function getNewItemsAndLog(maxRows) {
     logSheet = ss.insertSheet(SEND_LOG_SHEET);
     logSheet.appendRow(["送信日時", "シート名", "件数", "最新データ日付"]);
   }
-
-  // 前回の送信日時を取得（シートごとに最後の送信日時を管理）
-  const lastSentMap = getLastSentMap(logSheet);
 
   const results = [];
   let totalNew = 0;
