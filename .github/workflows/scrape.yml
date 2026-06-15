@@ -3,14 +3,25 @@ name: 防衛関連サイト スクレイピング
 on:
   schedule:
     - cron: "0 3 * * *"    # 12:00 JST
+    - cron: "0 9 * * *"    # 18:00 JST
+    - cron: "0 14 * * *"   # 23:00 JST
   workflow_dispatch:
 
 jobs:
   scrape:
     runs-on: self-hosted
-    timeout-minutes: 20
+    timeout-minutes: 45    # 💡 待機時間が最大30分加わるため、タイムアウトを20分から45分に延長
 
     steps:
+      - name: 実行時間をランダムに遅延（最大30分 / 1800秒）
+        if: github.event_name == 'schedule'  # 💡 手動実行（workflow_dispatch）時はスリープをスキップ
+        shell: bash
+        run: |
+          # 0〜1800秒（30分）のランダムな数値を生成
+          DELAY=$(( RANDOM % 1801 ))
+          echo "防衛省サイトへの配慮のため、${DELAY}秒間待機します..."
+          sleep $DELAY
+
       - name: リポジトリをチェックアウト
         uses: actions/checkout@v4
 
