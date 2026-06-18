@@ -13,14 +13,13 @@ jobs:
     timeout-minutes: 45    # 💡 待機時間が最大30分加わるため、タイムアウトを20分から45分に延長
 
     steps:
-      - name: 実行時間をランダムに遅延（最大30分 / 1800秒）
-        if: github.event_name == 'schedule'  # 💡 手動実行（workflow_dispatch）時はスリープをスキップ
-        shell: bash
+      - name: 実行時間をランダムに遅延（最大30分）
+        if: github.event_name == 'schedule'
+        shell: pwsh
         run: |
-          # 0〜1800秒（30分）のランダムな数値を生成
-          DELAY=$(( RANDOM % 1801 ))
-          echo "防衛省サイトへの配慮のため、${DELAY}秒間待機します..."
-          sleep $DELAY
+         $delay = Get-Random -Minimum 0 -Maximum 1801
+          Write-Host "防衛省サイトへの配慮のため、${delay}秒間待機します..."
+          Start-Sleep -Seconds $delay
 
       - name: リポジトリをチェックアウト
         uses: actions/checkout@v4
