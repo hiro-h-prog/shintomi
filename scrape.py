@@ -133,23 +133,31 @@ async def scrape_js_topics(session: AsyncSession) -> list[dict]:
     if not soup:
         return []
     result = []
-    seen = set()
-    for tag in soup.select("li, p, dt, dd"):
-        text = tag.get_text(" ", strip=True)
-        if len(text) < 20 or len(text) > 400:
+    BASE_URL = "https://www.mod.go.jp/js/about/topics.html"
+
+    # li[id] を直接取得（各記事のコンテナ）
+    for li in soup.select("li[id]"):
+        # id属性（例: "20260609"）をアンカーURLに使用
+        article_id = li.get("id", "")
+        url = f"{BASE_URL}#{article_id}" if article_id else BASE_URL
+
+        # タイトルは h3 から取得
+        h3 = li.select_one("h3")
+        title = h3.get_text(strip=True) if h3 else ""
+        if not title:
             continue
-        if any(text.startswith(p) for p in NAV_PREFIXES):
-            continue
-        key = text[:40]
-        if key in seen:
-            continue
-        seen.add(key)
-        a = tag.find("a")
-        href = a["href"] if a and a.get("href") else ""
-        url = ("https://www.mod.go.jp" + href) if href and not href.startswith("http") else href
-        result.append({"date": extract_date(text), "title": text[:150], "url": url, "body": ""})
+
+        # 日付は time タグから取得
+        time_tag = li.select_one("time")
+        date_text = time_tag.get("datetime", "") if time_tag else ""
+        # datetime="2026-06-09" → "2026年06月09日" に変換
+        m = re.match(r'(\d{4})-(\d{2})-(\d{2})', date_text)
+        date = f"{m.group(1)}年{int(m.group(2)):02d}月{int(m.group(3)):02d}日" if m else ""
+
+        result.append({"date": date, "title": title[:150], "url": url, "body": ""})
         if len(result) >= 20:
             break
+
     return result
 
 async def scrape_asdf_news(session: AsyncSession) -> list[dict]:
